@@ -210,6 +210,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 
 		switch v := req.Request.(type) {
 		case *extProcPb.ProcessingRequest_RequestHeaders:
+			// [RRR] Received request headers.
 			requestID := requtil.ExtractHeaderValue(v, requtil.RequestIdHeaderKey)
 			// request ID is a must for maintaining a state per request in plugins that hold internal state and use PluginState.
 			// if request id was not supplied as a header, we generate it ourselves.
@@ -224,13 +225,16 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 
 			err = s.HandleRequestHeaders(ctx, reqCtx, v)
 		case *extProcPb.ProcessingRequest_RequestBody:
+			// [RRR] Received body chunk. We need to append them
 			loggerTrace.Info("Incoming body chunk", "EoS", v.RequestBody.EndOfStream)
 			// In the stream case, we can receive multiple request bodies.
 			body = append(body, v.RequestBody.Body...)
 
 			// Message is buffered, we can read and decode.
 			if v.RequestBody.EndOfStream {
+				// [RRR] The stream has ended, process it.
 				reqCtx.RequestSize = len(body)
+				// [RRR] Process it
 				err = s.handleRequestBodyCompletion(ctx, reqCtx, body)
 				// Reset body buffer after processing
 				body = []byte{}
@@ -243,6 +247,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 		case *extProcPb.ProcessingRequest_RequestTrailers:
 			// This is currently unused.
 		case *extProcPb.ProcessingRequest_ResponseHeaders:
+			// [RRR] Received response headers
 			for _, header := range v.ResponseHeaders.Headers.GetHeaders() {
 				value := string(header.RawValue)
 
@@ -395,12 +400,14 @@ func (s *StreamingServer) handleRequestBodyCompletion(ctx context.Context, reqCt
 		// Currently, for gRPC request, we don't modify anything inside the gRPC request.
 		// So just pass it as is.
 		requestBodyBytes = body
+		// This is a gRPC request. Pass it through transparently with eavesdropping.
 	} else {
 		requestBodyBytes, err = json.Marshal(reqCtx.Request.Body)
 		if err != nil {
 			logger.V(logutil.DEFAULT).Error(err, "Error marshalling request body")
 			return err
 		}
+		// This is an OpenAI/JSON request.
 	}
 
 	// Update RequestSize to match marshalled body for Content-Length header.
