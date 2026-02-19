@@ -53,7 +53,7 @@ type EndpointPickerRefApplyConfiguration struct {
 	// resource or this field.
 	Port *PortApplyConfiguration `json:"port,omitempty"`
 	// FailureMode configures how the parent handles the case when the Endpoint Picker extension
-	// is non-responsive. When unspecified, defaults to "FailClose".
+	// is non-responsive. When unspecified, defaults to "FailOpen".
 	FailureMode *apiv1.EndpointPickerFailureMode `json:"failureMode,omitempty"`
 }
 
