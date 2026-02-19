@@ -20,6 +20,7 @@ import (
 	"context"
 	"maps"
 	"strconv"
+	"strings"
 	"time"
 
 	configPb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -165,6 +166,20 @@ func (s *StreamingServer) generateHeaders(ctx context.Context, reqCtx *RequestCo
 		if request.IsSystemOwnedHeader(key) {
 			continue
 		}
+
+		// If transcoding is enabled, we need to rewrite the Content-Type header to grpc
+		if strings.ToLower(key) == "content-type" {
+			if s.isConversionEnabled() {
+				headers = append(headers, &configPb.HeaderValueOption{
+					Header: &configPb.HeaderValue{
+						Key:      key,
+						RawValue: []byte(request.GRPCContentType),
+					},
+				})
+				continue
+			}
+		}
+
 		headers = append(headers, &configPb.HeaderValueOption{
 			Header: &configPb.HeaderValue{
 				Key:      key,

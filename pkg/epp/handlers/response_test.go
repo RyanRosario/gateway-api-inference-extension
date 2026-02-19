@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/util/logging"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datalayer"
 	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 	fwkrq "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/metadata"
@@ -112,6 +113,15 @@ func (m *mockDirector) GetRandomEndpoint() *fwkdl.EndpointMetadata {
 }
 func (m *mockDirector) HandleRequest(ctx context.Context, reqCtx *RequestContext) (*RequestContext, error) {
 	return reqCtx, nil
+}
+
+type mockDataStore struct {
+	pool *datalayer.EndpointPool
+	err  error
+}
+
+func (m *mockDataStore) PoolGet() (*datalayer.EndpointPool, error) {
+	return m.pool, m.err
 }
 
 func TestHandleResponseBody(t *testing.T) {
@@ -307,7 +317,9 @@ func TestHandleResponseBodyModelStreaming_TokenAccumulation(t *testing.T) {
 }
 
 func TestGenerateResponseHeaders_Sanitization(t *testing.T) {
-	server := &StreamingServer{}
+	server := &StreamingServer{
+		datastore: &mockDataStore{}, // Initialize datastore
+	}
 	reqCtx := &RequestContext{
 		Response: &Response{
 			Headers: map[string]string{

@@ -18,7 +18,9 @@ package handlers
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -26,17 +28,19 @@ import (
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoyTypePb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/go-logr/logr"
+	"github.com/gogo/protobuf/proto"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
-	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/util/logging"
+	pb "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/api/gen"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/datalayer"
+	fwkdl "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/datalayer"
 	fwkrq "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/requestcontrol"
 	schedulingtypes "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/scheduling"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/metrics"
@@ -112,6 +116,7 @@ type RequestContext struct {
 	respHeaderResp  *extProcPb.ProcessingResponse
 	respBodyResp    []*extProcPb.ProcessingResponse
 	respTrailerResp *extProcPb.ProcessingResponse
+	responseBuffer  []byte
 }
 
 type Request struct {
@@ -248,6 +253,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			// This is currently unused.
 		case *extProcPb.ProcessingRequest_ResponseHeaders:
 			// [RRR] Received response headers
+			// [RRR] This seems like a waste
 			for _, header := range v.ResponseHeaders.Headers.GetHeaders() {
 				value := string(header.RawValue)
 
@@ -287,44 +293,79 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				s.HandleResponseBodyModelStreaming(ctx, reqCtx, v.ResponseBody.Body)
 				if v.ResponseBody.EndOfStream {
 					loggerTrace.Info("stream completed")
-					if _, err := s.director.HandleResponseBodyComplete(ctx, reqCtx); err != nil {
-						logger.Error(err, "error in HandleResponseBodyComplete")
-					}
 					metrics.RecordRequestLatencies(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp)
 					metrics.RecordResponseSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.ResponseSize)
 					metrics.RecordNormalizedTimePerOutputToken(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp, reqCtx.Usage.CompletionTokens)
 				}
 
-				reqCtx.respBodyResp = generateResponseBodyResponses(v.ResponseBody.Body, v.ResponseBody.EndOfStream)
-			} else {
+				if s.isConversionEnabled() {
+					// Transcode gRPC response back to JSON
+					jsonBody, err := s.transcodeGRPCtoJSON(ctx, v.ResponseBody.Body)
+					if err != nil {
+						logger.Error(err, "Error transcoding gRPC response to JSON")
+						// Fallback to passing through the original body on error
+						reqCtx.respBodyResp = generateResponseBodyResponses(v.ResponseBody.Body, v.ResponseBody.EndOfStream)
+					} else {
+						reqCtx.respBodyResp = generateResponseBodyResponses(jsonBody, v.ResponseBody.EndOfStream)
+						// TODO: Update usage metrics from transcoded body if possible
+					}
+				} else {
+					// Standard JSON or streaming passthrough
+					reqCtx.respBodyResp = generateResponseBodyResponses(v.ResponseBody.Body, v.ResponseBody.EndOfStream)
+				}
+
+				if v.ResponseBody.EndOfStream {
+					loggerTrace.Info("stream completed")
+					if !s.isConversionEnabled() { // Metrics are handled differently in gRPC transcoding
+						if _, err := s.director.HandleResponseBodyComplete(ctx, reqCtx); err != nil {
+							logger.Error(err, "error in HandleResponseBodyComplete")
+						}
+						metrics.RecordRequestLatencies(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp)
+						metrics.RecordResponseSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.ResponseSize)
+						metrics.RecordNormalizedTimePerOutputToken(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp, reqCtx.Usage.CompletionTokens)
+					}
+				}
+			} else { // Non-streaming response handling
 				body = append(body, v.ResponseBody.Body...)
 
 				// Message is buffered, we can read and decode.
 				if v.ResponseBody.EndOfStream {
+					// [RRR] End of ENVOY stream
 					loggerTrace.Info("stream completed")
-					// Don't send a 500 on a response error. Just let the message passthrough and log our error for debugging purposes.
-					// We assume the body is valid JSON, err messages are not guaranteed to be json, and so capturing and sending a 500 obfuscates the response message.
-					// Using the standard 'err' var will send an immediate error response back to the caller.
-					var responseErr error
-					responseErr = json.Unmarshal(body, &responseBody)
-					if responseErr != nil {
-						if logger.V(logutil.DEBUG).Enabled() {
-							logger.V(logutil.DEBUG).Error(responseErr, "Error unmarshalling request body", "body", string(body))
-						} else {
-							logger.V(logutil.DEFAULT).Error(responseErr, "Error unmarshalling request body", "body", string(body))
-						}
-						reqCtx.respBodyResp = generateResponseBodyResponses(body, true)
-						break
-					}
 
-					reqCtx, responseErr = s.HandleResponseBody(ctx, reqCtx, responseBody)
-					if responseErr != nil {
-						if logger.V(logutil.DEBUG).Enabled() {
-							logger.V(logutil.DEBUG).Error(responseErr, "Failed to process response body", "request", req)
+					if s.isConversionEnabled() {
+						// Transcode gRPC response back to JSON
+						jsonBody, err := s.transcodeGRPCtoJSON(ctx, body)
+						if err != nil {
+							logger.Error(err, "Error transcoding gRPC response to JSON")
+							reqCtx.respBodyResp = generateResponseBodyResponses(body, true)
 						} else {
-							logger.V(logutil.DEFAULT).Error(responseErr, "Failed to process response body")
+							reqCtx.respBodyResp = generateResponseBodyResponses(jsonBody, true)
+							// TODO: Update usage metrics from transcoded body
 						}
-					} else if reqCtx.ResponseComplete {
+						// TODO: Call HandleResponseBody with the map from transcodeGRPCtoJSON?
+					} else {
+						var responseErr error
+						responseErr = json.Unmarshal(body, &responseBody)
+						if responseErr != nil {
+							if logger.V(logutil.DEBUG).Enabled() {
+								logger.V(logutil.DEBUG).Error(responseErr, "Error unmarshalling response body", "body", string(body))
+							} else {
+								logger.V(logutil.DEFAULT).Error(responseErr, "Error unmarshalling response body", "body", string(body))
+							}
+							reqCtx.respBodyResp = generateResponseBodyResponses(body, true)
+							break
+						}
+						reqCtx, responseErr = s.HandleResponseBody(ctx, reqCtx, responseBody)
+						if responseErr != nil {
+							if logger.V(logutil.DEBUG).Enabled() {
+								logger.V(logutil.DEBUG).Error(responseErr, "Failed to process response body", "request", req)
+							} else {
+								logger.V(logutil.DEFAULT).Error(responseErr, "Failed to process response body")
+							}
+						}
+					}
+					if reqCtx.ResponseComplete { // This block should run for both transcoded and non-transcoded
 						metrics.RecordRequestLatencies(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestReceivedTimestamp, reqCtx.ResponseCompleteTimestamp)
 						metrics.RecordResponseSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.ResponseSize)
 						metrics.RecordInputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Usage.PromptTokens)
@@ -381,13 +422,18 @@ func (s *StreamingServer) handleRequestBodyCompletion(ctx context.Context, reqCt
 	if reqCtx.ReqContentType == requtil.GRPCContentType {
 		err = s.handleGRPCRequestBody(ctx, reqCtx, body)
 	} else {
-		err = s.handleJSONRequestBody(ctx, reqCtx, body)
+		if s.isConversionEnabled() {
+			err = s.handleJSONtoGRPCTranscoding(ctx, reqCtx, body)
+		} else {
+			err = s.handleJSONRequestBody(ctx, reqCtx, body)
+		}
 	}
 
 	if err != nil {
 		return err
 	}
 
+	// [RRR] This should be renamed to HandleRequestBody
 	reqCtx, err = s.director.HandleRequest(ctx, reqCtx)
 	if err != nil {
 		logger.V(logutil.DEFAULT).Error(err, "Error handling request")
@@ -400,14 +446,21 @@ func (s *StreamingServer) handleRequestBodyCompletion(ctx context.Context, reqCt
 		// Currently, for gRPC request, we don't modify anything inside the gRPC request.
 		// So just pass it as is.
 		requestBodyBytes = body
-		// This is a gRPC request. Pass it through transparently with eavesdropping.
+		// [RRR] This is a gRPC request. Pass it through transparently with eavesdropping.
+	} else if s.isConversionEnabled() {
+		// [RRR] Phase 2: Transcode JSON map into gRPC frame
+		requestBodyBytes, err = s.transcodeMapToGRPC(reqCtx)
+		if err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Error transcoding request body to gRPC")
+			return err
+		}
 	} else {
+		// [RRR] This is an OpenAI/JSON request.
 		requestBodyBytes, err = json.Marshal(reqCtx.Request.Body)
 		if err != nil {
 			logger.V(logutil.DEFAULT).Error(err, "Error marshalling request body")
 			return err
 		}
-		// This is an OpenAI/JSON request.
 	}
 
 	// Update RequestSize to match marshalled body for Content-Length header.
@@ -418,6 +471,195 @@ func (s *StreamingServer) handleRequestBodyCompletion(ctx context.Context, reqCt
 	metrics.RecordRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName)
 	metrics.RecordRequestSizes(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.RequestSize)
 	return nil
+}
+
+// isConversionEnabled returns true if the current EndpointPool is configured for gRPC protocols
+func (s *StreamingServer) isConversionEnabled() bool {
+	pool, err := s.datastore.PoolGet()
+	return err == nil && pool != nil && pool.AppProtocol == "kubernetes.io/h2c"
+}
+
+// handleJSONtoGRPCTranscoding parses JSON logic but sets the gRPC scheduling data for Flow Control.
+func (s *StreamingServer) handleJSONtoGRPCTranscoding(ctx context.Context, reqCtx *RequestContext, body []byte) error {
+	logger := log.FromContext(ctx)
+
+	if errUnmarshal := json.Unmarshal(body, &reqCtx.Request.Body); errUnmarshal != nil {
+		if logger.V(logutil.DEBUG).Enabled() {
+			logger.Info("Error unmarshaling request body", "body", string(body), "err", errUnmarshal)
+		}
+		return errutil.Error{
+			Code: errutil.BadRequest,
+			Msg:  "Error unmarshaling request body",
+		}
+	}
+
+	isStreaming := false
+	if streamVal, ok := reqCtx.Request.Body["stream"].(bool); ok {
+		isStreaming = streamVal
+	}
+	reqCtx.modelServerStreaming = isStreaming
+
+	var prompt string
+	if messages, ok := reqCtx.Request.Body["messages"].([]interface{}); ok && len(messages) > 0 {
+		if lastMsg, ok := messages[len(messages)-1].(map[string]interface{}); ok {
+			if content, ok := lastMsg["content"].(string); ok {
+				prompt = content
+			}
+		}
+	} else if promptStr, ok := reqCtx.Request.Body["prompt"].(string); ok {
+		prompt = promptStr
+	}
+
+	reqCtx.SchedulingRequestBody = &schedulingtypes.LLMRequestBody{
+		Completions: &schedulingtypes.CompletionsRequest{
+			Prompt: prompt,
+		},
+	}
+	return nil
+}
+
+func (s *StreamingServer) transcodeMapToGRPC(reqCtx *RequestContext) ([]byte, error) {
+	prompt := ""
+	if reqCtx.SchedulingRequestBody != nil && reqCtx.SchedulingRequestBody.Completions != nil {
+		prompt = reqCtx.SchedulingRequestBody.Completions.Prompt
+	}
+
+	samplingParams := &pb.SamplingParams{}
+
+	if val, ok := reqCtx.Request.Body["temperature"].(float64); ok {
+		t := float32(val)
+		samplingParams.Temperature = &t
+	}
+	if val, ok := reqCtx.Request.Body["top_p"].(float64); ok {
+		samplingParams.TopP = float32(val)
+	}
+	if val, ok := reqCtx.Request.Body["top_k"].(float64); ok {
+		samplingParams.TopK = uint32(val)
+	}
+	if val, ok := reqCtx.Request.Body["max_tokens"].(float64); ok {
+		m := uint32(val)
+		samplingParams.MaxTokens = &m
+	}
+	if val, ok := reqCtx.Request.Body["presence_penalty"].(float64); ok {
+		samplingParams.PresencePenalty = float32(val)
+	}
+	if val, ok := reqCtx.Request.Body["frequency_penalty"].(float64); ok {
+		samplingParams.FrequencyPenalty = float32(val)
+	}
+	if val, ok := reqCtx.Request.Body["stop"].([]interface{}); ok {
+		for _, s := range val {
+			if str, ok := s.(string); ok {
+				samplingParams.Stop = append(samplingParams.Stop, str)
+			}
+		}
+	} else if val, ok := reqCtx.Request.Body["stop"].(string); ok {
+		samplingParams.Stop = append(samplingParams.Stop, val)
+	}
+
+	// vLLM Engine GenerateRequest
+	grpcReq := &pb.GenerateRequest{
+		RequestId: uuid.NewString(), // Generate fresh tracing ID
+		Input: &pb.GenerateRequest_Text{
+			Text: prompt,
+		},
+		SamplingParams: samplingParams,
+		Stream:         reqCtx.modelServerStreaming,
+	}
+
+	payload, err := proto.Marshal(grpcReq)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wrap in gRPC framing: 1 byte compression flag (0) + 4 bytes length
+	frame := make([]byte, 5+len(payload))
+	frame[0] = 0 // Uncompressed
+	binary.BigEndian.PutUint32(frame[1:5], uint32(len(payload)))
+	copy(frame[5:], payload)
+
+	return frame, nil
+}
+
+func (s *StreamingServer) transcodeGRPCtoJSON(ctx context.Context, grpcBody []byte) ([]byte, error) {
+	logger := log.FromContext(ctx)
+	logger.V(logutil.TRACE).Info("Transcoding gRPC response to JSON", "grpcBodyLen", len(grpcBody))
+
+	if len(grpcBody) < 5 {
+		return nil, fmt.Errorf("gRPC body too short to contain frame")
+	}
+
+	// TODO: Handle streaming chunks properly, may need to buffer multiple gRPC messages
+	// For now, assumes a single complete GenerateResponse message per v.ResponseBody.Body
+
+	payload := grpcBody[5:]
+	grpcResp := &pb.GenerateResponse{}
+	err := proto.Unmarshal(payload, grpcResp)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling gRPC response payload: %w", err)
+	}
+
+	logger.V(logutil.TRACE).Info("Successfully unmarshalled gRPC response")
+
+	openAIResp := make(map[string]interface{})
+	openAIResp["id"] = uuid.NewString() // Generate a new ID
+	openAIResp["created"] = time.Now().Unix()
+
+	switch respType := grpcResp.Response.(type) {
+	case *pb.GenerateResponse_Chunk:
+		logger.V(logutil.TRACE).Info("transcodeGRPCtoJSON: Chunk")
+		openAIResp["object"] = "chat.completion.chunk"
+		// This requires a tokenizer to convert TokenIds back to text
+		// Placeholder:
+		tokenText := fmt.Sprintf("%v", respType.Chunk.GetTokenIds()) // Incorrect: Replace with actual token decoding
+
+		openAIResp["choices"] = []interface{}{
+			map[string]interface{}{
+				"delta": map[string]interface{}{"content": tokenText},
+				"index": 0,
+			},
+		}
+		// TODO: Add finish_reason if it's the last chunk
+
+	case *pb.GenerateResponse_Complete:
+		logger.V(logutil.TRACE).Info("transcodeGRPCtoJSON: Complete")
+		openAIResp["object"] = "chat.completion"
+		// This requires a tokenizer to convert OutputIds back to text
+		// Placeholder:
+		tokenText := fmt.Sprintf("%v", respType.Complete.GetOutputIds()) // Incorrect: Replace with actual token decoding
+
+		openAIResp["choices"] = []interface{}{
+			map[string]interface{}{
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": tokenText,
+				},
+				"index":         0,
+				"finish_reason": respType.Complete.FinishReason,
+			},
+		}
+		openAIResp["usage"] = map[string]interface{}{
+			"prompt_tokens":     respType.Complete.PromptTokens,
+			"completion_tokens": respType.Complete.CompletionTokens,
+			"total_tokens":      respType.Complete.PromptTokens + respType.Complete.CompletionTokens,
+		}
+		// TODO: Update reqCtx.Usage for metrics
+		// reqCtx.Usage = fwkrq.Usage{...}
+	default:
+		return nil, fmt.Errorf("unknown gRPC response type")
+	}
+
+	jsonBody, err := json.Marshal(openAIResp)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling OpenAI response to JSON: %w", err)
+	}
+
+	// For streaming, newlines are often used as delimiters
+	if _, ok := grpcResp.Response.(*pb.GenerateResponse_Chunk); ok {
+		jsonBody = append(jsonBody, '\n')
+	}
+
+	logger.V(logutil.TRACE).Info("Successfully transcoded gRPC to JSON", "jsonBody", string(jsonBody))
+	return jsonBody, nil
 }
 
 // handleJSONRequestBody handles JSON request body unmarshaling.

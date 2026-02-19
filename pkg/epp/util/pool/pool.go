@@ -41,6 +41,7 @@ func InferencePoolToEndpointPool(inferencePool *v1.InferencePool) *datalayer.End
 		TargetPorts: targetPorts,
 		Namespace:   inferencePool.Namespace,
 		Name:        inferencePool.Name,
+		AppProtocol: string(inferencePool.Spec.AppProtocol),
 	}
 	return endpointPool
 }
@@ -83,6 +84,7 @@ func EndpointPoolToInferencePool(endpointPool *datalayer.EndpointPool) *v1.Infer
 		Spec: v1.InferencePoolSpec{
 			Selector:    v1.LabelSelector{MatchLabels: labels},
 			TargetPorts: targetPorts,
+			AppProtocol: v1.AppProtocol(endpointPool.AppProtocol),
 		},
 	}
 	return inferencePool

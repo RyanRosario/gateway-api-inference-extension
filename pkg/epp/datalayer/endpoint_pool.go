@@ -21,6 +21,7 @@ type EndpointPool struct {
 	TargetPorts []int
 	Namespace   string
 	Name        string
+	AppProtocol string
 }
 
 // NewEndpointPool creates and returns a new empty instance of EndpointPool.
@@ -30,5 +31,6 @@ func NewEndpointPool(namespace string, name string) *EndpointPool {
 		TargetPorts: []int{},
 		Namespace:   namespace,
 		Name:        name,
+		AppProtocol: "",
 	}
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package handlers
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -123,30 +124,51 @@ func (s *StreamingServer) HandleResponseBodyModelStreaming(ctx context.Context, 
 	if reqCtx.RespContentType == request.GRPCContentType {
 		s.handleGRPCResponseBodyModelStreaming(ctx, reqCtx, responseBytes)
 	} else {
-		s.handleResponseBodyModelStreamingInText(ctx, reqCtx, string(responseBytes))
+		// [RRR] JSON?
+		reqCtx.responseBuffer = append(reqCtx.responseBuffer, responseBytes...)
+		var lines []string
+		for {
+			advance, token, err := bufio.ScanLines(reqCtx.responseBuffer, false)
+			if err != nil {
+				// Error during scanning, stop processing this chunk
+				break
+			}
+			if advance == 0 {
+				// No complete line found
+				break
+			}
+			lines = append(lines, string(token))
+			reqCtx.responseBuffer = reqCtx.responseBuffer[advance:]
+		}
+
+		if len(lines) > 0 {
+			s.handleResponseBodyModelStreamingInText(ctx, reqCtx, lines)
+		}
 	}
 }
 
-func (s *StreamingServer) handleResponseBodyModelStreamingInText(ctx context.Context, reqCtx *RequestContext, responseText string) {
+func (s *StreamingServer) handleResponseBodyModelStreamingInText(ctx context.Context, reqCtx *RequestContext, lines []string) {
 	logger := log.FromContext(ctx)
 	_, err := s.director.HandleResponseBodyStreaming(ctx, reqCtx)
 	if err != nil {
 		logger.Error(err, "error in HandleResponseBodyStreaming")
 	}
 
-	// Parse usage on EVERY chunk to catch split streams (where usage and [DONE] are in different chunks).
-	if resp := parseRespForUsage(ctx, responseText); resp.Usage.TotalTokens > 0 {
-		reqCtx.Usage = resp.Usage
-	}
-
-	if strings.Contains(responseText, streamingEndMsg) {
-		metrics.RecordInputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Usage.PromptTokens)
-		metrics.RecordOutputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Usage.CompletionTokens)
-		cachedToken := 0
-		if reqCtx.Usage.PromptTokenDetails != nil {
-			cachedToken = reqCtx.Usage.PromptTokenDetails.CachedTokens
+	for _, line := range lines {
+		// Parse usage on EVERY chunk to catch split streams (where usage and [DONE] are in different chunks).
+		if resp := parseRespForUsage(ctx, line); resp.Usage.TotalTokens > 0 {
+			reqCtx.Usage = resp.Usage
 		}
-		metrics.RecordPromptCachedTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, cachedToken)
+
+		if strings.Contains(line, streamingEndMsg) {
+			metrics.RecordInputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Usage.PromptTokens)
+			metrics.RecordOutputTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, reqCtx.Usage.CompletionTokens)
+			cachedToken := 0
+			if reqCtx.Usage.PromptTokenDetails != nil {
+				cachedToken = reqCtx.Usage.PromptTokenDetails.CachedTokens
+			}
+			metrics.RecordPromptCachedTokens(reqCtx.IncomingModelName, reqCtx.TargetModelName, cachedToken)
+		}
 	}
 }
 
@@ -214,6 +236,39 @@ func (s *StreamingServer) generateResponseHeaders(reqCtx *RequestContext) []*con
 			},
 		})
 	}
+	if s.isConversionEnabled() && reqCtx.ReqContentType != request.GRPCContentType {
+		// If we transcoded from JSON -> gRPC on request, we are transcoding gRPC -> JSON on response
+		// So, force Content-Type to application/json or text/event-stream
+		foundContentType := false
+		for _, header := range headers {
+			if strings.ToLower(header.Header.Key) == "content-type" {
+				newContentType := "application/json"
+				if reqCtx.modelServerStreaming {
+					newContentType = "text/event-stream"
+				}
+				header.Header.RawValue = []byte(newContentType)
+				foundContentType = true
+				break
+			}
+		}
+		if !foundContentType {
+			contentType := "application/json"
+			if reqCtx.modelServerStreaming {
+				contentType = "text/event-stream"
+			}
+			headers = append(headers, &configPb.HeaderValueOption{
+				Header: &configPb.HeaderValue{
+					Key:      "Content-Type",
+					RawValue: []byte(contentType),
+				},
+			})
+		}
+		// Example of removing a gRPC-specific header:
+		// headers = slices.DeleteFunc(headers, func(h *configPb.HeaderValueOption) bool {
+		// 	 return strings.ToLower(h.Header.Key) == "content-encoding"
+		// })
+	}
+
 	return headers
 }
 
@@ -242,13 +297,16 @@ func parseRespForUsage(ctx context.Context, responseText string) ResponseBody {
 			continue
 		}
 
+		// [RRR] Convert content into a slice of bytes and umarshal it into response.
 		byteSlice := []byte(content)
+		// [RRR] response is basically a mutable variable that gets updated with each chunk.
 		if err := json.Unmarshal(byteSlice, &response); err != nil {
 			logger.Error(err, "unmarshaling response body")
 			continue
 		}
 	}
 
+	// [RRR] Was there actually any usage data in this chunk?
 	return response
 }
 
