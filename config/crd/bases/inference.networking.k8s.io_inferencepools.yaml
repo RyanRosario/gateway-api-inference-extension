@@ -62,10 +62,10 @@ spec:
                   associated configuration.
                 properties:
                   failureMode:
-                    default: FailOpen
+                    default: FailClose
                     description: |-
                       FailureMode configures how the parent handles the case when the Endpoint Picker extension
-                      is non-responsive. When unspecified, defaults to "FailOpen".
+                      is non-responsive. When unspecified, defaults to "FailClose".
                     enum:
                     - FailOpen
                     - FailClose

@@ -166,10 +166,10 @@ type EndpointPickerRef struct {
 	Port *Port `json:"port,omitempty"`
 
 	// FailureMode configures how the parent handles the case when the Endpoint Picker extension
-	// is non-responsive. When unspecified, defaults to "FailOpen".
+	// is non-responsive. When unspecified, defaults to "FailClose".
 	//
 	// +optional
-	// +kubebuilder:default="FailOpen"
+	// +kubebuilder:default="FailClose"
 	FailureMode EndpointPickerFailureMode `json:"failureMode,omitempty"`
 }
 

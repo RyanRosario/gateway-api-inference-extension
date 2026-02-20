@@ -39,14 +39,14 @@ spec:
   extensionRef:
     name: vllm-qwen3-32b-epp
     port: 9002
-    failureMode: FailOpen
+    failureMode: FailClose
 ```
 
 In this example: 
 
 - An InferencePool named `vllm-llama3-8b-instruct` is created in the `default` namespace.
 - It will select Pods that have the label `app: vllm-llama3-8b-instruct`.
-- Traffic routed to this InferencePool is managed by the proxy, which calls out to the EPP service `vllm-llama3-8b-instruct-epp` on port `9002` for making routing decisions. If EPP fails to pick an endpoint, or is not responsive, the request will drop down to base round-robin routing because we specified `FailOpen`. It is highly recommended to use `FailOpen` so that traffic will still be served if the custom Endpoint Picker goes down.
+- Traffic routed to this InferencePool will call out to the EPP service `vllm-llama3-8b-instruct-epp` on port `9002` for making routing decisions. If EPP fails to pick an endpoint, or is not responsive, the request will be dropped.
 - Traffic routed to this InferencePool will be forwarded to the port `8000` on the selected Pods.
 
 ## Overlap with Service
