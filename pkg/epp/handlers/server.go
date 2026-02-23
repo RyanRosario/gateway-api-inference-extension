@@ -273,7 +273,6 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 		case *extProcPb.ProcessingRequest_ResponseBody:
 			reqCtx.ResponseComplete = v.ResponseBody.EndOfStream
 			if reqCtx.ResponseComplete {
-				loggerTrace.Info("stream completed")
 				reqCtx.ResponseCompleteTimestamp = time.Now()
 			}
 			if reqCtx.modelServerStreaming {
@@ -383,6 +382,8 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 	}
 	if r.RequestState == HeaderResponseResponseComplete {
 		loggerTrace.Info("Sending response body response(s)")
+	if r.RequestState == HeaderResponseResponseComplete {
+		loggerTrace.Info("Sending response body response(s)")
 		for _, response := range r.respBodyResp {
 			if err := srv.Send(response); err != nil {
 				return status.Errorf(codes.Unknown, "failed to send response back to Envoy: %v", err)
@@ -390,6 +391,12 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 		}
 		if r.ResponseComplete {
 			logger.V(1).Info("EPP sent response body back to proxy")
+			r.RequestState = BodyResponseResponsesComplete
+		}
+		if r.ResponseComplete {
+			r.RequestState = BodyResponseResponsesComplete
+		}
+		if r.ResponseComplete {
 			r.RequestState = BodyResponseResponsesComplete
 		}
 		// Dump the response so a new stream message can begin
