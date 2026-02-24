@@ -46,6 +46,7 @@ In this example:
 
 - An InferencePool named `vllm-qwen3-32b` is created in the `default` namespace.
 - It will select Pods that have the label `app: vllm-qwen3-32b`.
+- Traffic routed to this InferencePool will call out to the EPP service `vllm-qwen3-32b-epp` on port `9002` for making routing decisions. If EPP fails to pick an endpoint, or is not responsive, the request will be dropped.
 - Traffic routed to this InferencePool will be forwarded to the port `8000` on the selected Pods.
 
 ## Overlap with Service
